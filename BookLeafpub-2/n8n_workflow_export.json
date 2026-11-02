@@ -1,0 +1,601 @@
+{
+    "name": "BookLeaf - Author Royalty Summary Automation",
+    "nodes": [
+        {
+            "parameters": {
+                "httpMethod": "POST",
+                "path": "bookleaf-royalty-summary",
+                "authentication": "headerAuth",
+                "responseMode": "responseNode",
+                "options": {}
+            },
+            "id": "node-webhook-trigger",
+            "name": "Webhook Trigger",
+            "type": "n8n-nodes-base.webhook",
+            "typeVersion": 1.1,
+            "position": [
+                240,
+                300
+            ],
+            "webhookId": "bookleaf-royalty-summary",
+            "notes": "Entry point. Receives POST from Bubble with author payload. Protected by x-api-key header auth.",
+            "credentials": {
+                "httpHeaderAuth": {
+                    "id": "cred-header-auth",
+                    "name": "BookLeaf Webhook API Key"
+                }
+            }
+        },
+        {
+            "parameters": {
+                "jsCode": "// ─── IDEMPOTENCY CHECK ───────────────────────────────────────────\n// Validate all required fields and generate a deduplication key\n// based on author_id + current UTC date (day-level granularity)\nconst body = $json.body || $json;\nconst authorId = body.author_id;\nconst triggeredAt = body.triggered_at || new Date().toISOString();\nconst logId = body.log_id || null;\n\nif (!authorId) {\n  throw new Error('Missing required field: author_id');\n}\n\n// Build dedup key: same author, same calendar day => same key\nconst today = new Date().toISOString().split('T')[0];\nconst dedupKey = `${authorId}::${today}`;\n\nreturn [{\n  json: {\n    author_id: authorId,\n    log_id: logId,\n    triggered_at: triggeredAt,\n    dedup_key: dedupKey,\n    bubble_base_url: body.bubble_base_url || 'https://YOUR-APP.bubbleapps.io/api/1.1/obj',\n    bubble_api_key: body.bubble_api_key || ''\n  }\n}];"
+            },
+            "id": "node-validate-input",
+            "name": "Validate & Extract Input",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                460,
+                300
+            ],
+            "notes": "Validates payload, builds deduplication key (author + date). Throws on missing author_id."
+        },
+        {
+            "parameters": {
+                "url": "={{ $json.bubble_base_url }}/author/{{ $json.author_id }}",
+                "authentication": "genericCredentialType",
+                "genericAuthType": "httpHeaderAuth",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Authorization",
+                            "value": "=Bearer {{ $json.bubble_api_key }}"
+                        }
+                    ]
+                },
+                "options": {
+                    "timeout": 10000
+                }
+            },
+            "id": "node-fetch-author",
+            "name": "Fetch Author Data from Bubble",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                680,
+                300
+            ],
+            "notes": "Pulls Author record from Bubble Data API. Alternatively full payload can be sent in webhook (both patterns are supported — see documentation).",
+            "onError": "continueErrorOutput"
+        },
+        {
+            "parameters": {
+                "url": "={{ $('Validate & Extract Input').item.json.bubble_base_url }}/book?constraints=[{\"key\":\"author_id\",\"constraint_type\":\"equals\",\"value\":\"{{ $('Validate & Extract Input').item.json.author_id }}\"}]",
+                "authentication": "genericCredentialType",
+                "genericAuthType": "httpHeaderAuth",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Authorization",
+                            "value": "=Bearer {{ $('Validate & Extract Input').item.json.bubble_api_key }}"
+                        }
+                    ]
+                },
+                "options": {
+                    "timeout": 10000
+                }
+            },
+            "id": "node-fetch-books",
+            "name": "Fetch Author's Books from Bubble",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                680,
+                460
+            ],
+            "notes": "Fetches all books belonging to this author from Bubble using constraint filtering.",
+            "onError": "continueErrorOutput"
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": true,
+                        "leftValue": "",
+                        "typeValidation": "strict"
+                    },
+                    "conditions": [
+                        {
+                            "id": "cond-fetch-success",
+                            "leftValue": "={{ $('Fetch Author Data from Bubble').item.json.status }}",
+                            "rightValue": 200,
+                            "operator": {
+                                "type": "number",
+                                "operation": "equals"
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                },
+                "options": {}
+            },
+            "id": "node-check-fetch",
+            "name": "Check Fetch Success",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [
+                900,
+                300
+            ],
+            "notes": "Branches on whether Bubble Data API returned successfully. On failure, triggers error handler."
+        },
+        {
+            "parameters": {
+                "jsCode": "// ─── AGGREGATE & ENRICH DATA ─────────────────────────────────────\nconst authorData = $('Fetch Author Data from Bubble').item.json.response || {};\nconst booksData = ($('Fetch Author Books from Bubble').item.json.response?.results) || [];\n\n// Compute consolidated totals\nlet totalEarned = 0, totalPaid = 0, totalPending = 0;\nconst publishedBooks = [];\nconst productionBooks = [];\n\nbooksData.forEach(book => {\n  totalEarned += (book.total_royalty_earned || 0);\n  totalPaid += (book.royalty_paid || 0);\n  totalPending += (book.royalty_pending || 0);\n\n  if (book.status && book.status.toLowerCase().includes('published')) {\n    publishedBooks.push(book);\n  } else {\n    productionBooks.push(book);\n  }\n});\n\n// Determine payout status label\nlet overallStatus = 'Fully Paid';\nif (totalPending > 0) {\n  // Check if any pending book has last_payout_date > 90 days ago or no payout at all\n  const now = new Date();\n  const isOverdue = publishedBooks.some(b => {\n    if (b.royalty_pending > 0) {\n      if (!b.last_royalty_payout_date) return true; // never paid\n      const last = new Date(b.last_royalty_payout_date);\n      const diffDays = (now - last) / (1000 * 60 * 60 * 24);\n      return diffDays > 90;\n    }\n    return false;\n  });\n  overallStatus = isOverdue ? 'Overdue' : 'Pending';\n}\n\n// Compute next expected payout quarter\nconst now = new Date();\nconst month = now.getMonth(); // 0-indexed\nlet nextPayoutQuarter;\nif (month < 3)      nextPayoutQuarter = 'Q1 (March 31 + 45 days = ~May 15)';\nelse if (month < 6) nextPayoutQuarter = 'Q2 (June 30 + 45 days = ~Aug 14)';\nelse if (month < 9) nextPayoutQuarter = 'Q3 (September 30 + 45 days = ~Nov 14)';\nelse                nextPayoutQuarter = 'Q4 (December 31 + 45 days = ~Feb 14)';\n\nreturn [{\n  json: {\n    author: {\n      id: authorData._id || $('Validate & Extract Input').item.json.author_id,\n      name: authorData.name || 'Author',\n      email: authorData.email || '',\n      city: authorData.city || ''\n    },\n    summary: {\n      total_earned: totalEarned,\n      total_paid: totalPaid,\n      total_pending: totalPending,\n      overall_status: overallStatus,\n      books_published: publishedBooks.length,\n      books_in_production: productionBooks.length,\n      next_payout_quarter: nextPayoutQuarter\n    },\n    published_books: publishedBooks,\n    production_books: productionBooks,\n    log_id: $('Validate & Extract Input').item.json.log_id,\n    bubble_base_url: $('Validate & Extract Input').item.json.bubble_base_url,\n    bubble_api_key: $('Validate & Extract Input').item.json.bubble_api_key\n  }\n}];"
+            },
+            "id": "node-aggregate-data",
+            "name": "Aggregate Author & Book Data",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1120,
+                300
+            ],
+            "notes": "Computes consolidated royalty totals, classifies books as published vs in-production, determines payout status and next expected quarter."
+        },
+        {
+            "parameters": {
+                "jsCode": "// ─── BUILD AI PROMPT ──────────────────────────────────────────────\nconst d = $json;\nconst a = d.author;\nconst s = d.summary;\n\n// Format currency helper\nconst fmt = n => `₹${Number(n).toLocaleString('en-IN')}`;\n\n// Build per-book section for published books\nlet bookDetails = '';\nd.published_books.forEach((b, i) => {\n  const statusBadge = b.royalty_pending === 0 ? '✅ Fully Paid'\n    : (!b.last_royalty_payout_date) ? '🔴 Never Paid'\n    : '🟡 Payment Pending';\n\n  bookDetails += `\n${i + 1}. \"${b.title}\" (${b.genre || 'General'})\n   - ISBN: ${b.isbn || 'N/A'}\n   - Published: ${b.publication_date ? new Date(b.publication_date).toDateString() : 'N/A'}\n   - MRP: ${b.mrp ? fmt(b.mrp) : 'N/A'} | Royalty per copy: ${b.author_royalty_per_copy ? fmt(b.author_royalty_per_copy) : 'N/A'}\n   - Total copies sold: ${b.total_copies_sold || 0}\n   - Total royalty earned: ${fmt(b.total_royalty_earned || 0)}\n   - Royalty paid to date: ${fmt(b.royalty_paid || 0)}\n   - Royalty pending: ${fmt(b.royalty_pending || 0)}\n   - Last payout date: ${b.last_royalty_payout_date ? new Date(b.last_royalty_payout_date).toDateString() : 'No payout yet'}\n   - Status: ${statusBadge}\n   - Available on: ${(b.available_on || []).join(', ') || 'N/A'}\n`;\n});\n\n// Build production books section\nlet productionDetails = '';\nif (d.production_books.length > 0) {\n  d.production_books.forEach((b, i) => {\n    productionDetails += `\\n${i + 1}. \"${b.title}\" — Current stage: ${b.status}`;\n  });\n}\n\nconst systemPrompt = `You are a warm, professional communication specialist for BookLeaf Publishing — a boutique self-publishing house based in India. Your job is to write personalised royalty summary emails to BookLeaf authors.\n\nBOOKLEAF COMMUNICATION TONE:\n- Warm, personal, and encouraging — authors are creative partners, not just clients\n- Professional but not corporate or cold\n- Use \"we\" and \"our team\" when referring to BookLeaf\n- Celebrate milestones (good sales numbers, fully paid royalties)\n- Be empathetic and transparent about pending amounts\n- Avoid jargon — write as if speaking to a creative person, not an accountant\n- Signature should be from \"The BookLeaf Team\"\n\nROYALTY PAYOUT POLICY (include where relevant):\n- BookLeaf processes royalty payouts quarterly: Q1 (Jan-Mar), Q2 (Apr-Jun), Q3 (Jul-Sep), Q4 (Oct-Dec)\n- Payouts are processed within 45 days after each quarter closes\n- Minimum payout threshold: ₹500\n- If royalty_pending > 0 and last payout was within 90 days, it is within normal cycle\n- If royalty_pending > 0 and last payout was over 90 days ago (or never), it may be overdue\n\nIMPORTANT RULES:\n- Do NOT include any placeholder text like [Author Name] or [Date]\n- Do NOT use generic filler phrases like \"I hope this email finds you well\"\n- DO use the actual numbers and dates from the data\n- DO personalise based on their specific books and situation\n- The email should be 250-400 words\n- Format with clear sections using line breaks (not HTML)\n- Start with \"Subject:\" on line 1, then a blank line, then the email body`;\n\nconst userPrompt = `Write a royalty summary email for the following BookLeaf author:\n\nAUTHOR DETAILS:\n- Name: ${a.name}\n- City: ${a.city || 'India'}\n\nCONSOLIDATED ROYALTY SUMMARY:\n- Total royalty earned (all books): ${fmt(s.total_earned)}\n- Total paid to date: ${fmt(s.total_paid)}\n- Total pending: ${fmt(s.total_pending)}\n- Overall payout status: ${s.overall_status}\n- Next expected payout window: ${s.next_payout_quarter}\n\nPUBLISHED BOOKS (${d.published_books.length} book${d.published_books.length !== 1 ? 's' : ''}):\n${bookDetails || 'None'}\n${d.production_books.length > 0 ? `\nBOOKS IN PRODUCTION (${d.production_books.length}):\n${productionDetails}` : ''}\n\nINSTRUCTIONS:\n- If ${s.total_pending} === 0: Celebrate that all royalties are fully paid up. Acknowledge their sales performance.\n- If ${s.total_pending} > 0 and status is \"Pending\": Explain the pending amount is within normal quarterly cycle and when they can expect it.\n- If ${s.total_pending} > 0 and status is \"Overdue\": Apologise for the delay, assure them the team is processing it, give next steps.\n- If there are books in production: Give a brief, encouraging status update.\n- Always close warmly from \"The BookLeaf Team\".`;\n\nreturn [{\n  json: {\n    ...d,\n    system_prompt: systemPrompt,\n    user_prompt: userPrompt\n  }\n}];"
+            },
+            "id": "node-build-prompt",
+            "name": "Build AI Prompt",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                1340,
+                300
+            ],
+            "notes": "Constructs the system and user prompts for the AI. Injects BookLeaf tone guidelines, payout policy, and all author-specific data. Handles all edge cases (no payout, overdue, in-production books)."
+        },
+        {
+            "parameters": {
+                "url": "https://api.openai.com/v1/chat/completions",
+                "authentication": "genericCredentialType",
+                "genericAuthType": "httpHeaderAuth",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Authorization",
+                            "value": "=Bearer YOUR_OPENAI_API_KEY"
+                        },
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "bodyParameters": {
+                    "parameters": []
+                },
+                "specifyBody": "json",
+                "jsonBody": "={\n  \"model\": \"gpt-4o-mini\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": {{ JSON.stringify($json.system_prompt) }}\n    },\n    {\n      \"role\": \"user\",\n      \"content\": {{ JSON.stringify($json.user_prompt) }}\n    }\n  ],\n  \"temperature\": 0.7,\n  \"max_tokens\": 1000\n}",
+                "options": {
+                    "timeout": 30000
+                }
+            },
+            "id": "node-openai-call",
+            "name": "Call OpenAI API",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                1560,
+                300
+            ],
+            "notes": "Sends the crafted prompt to gpt-4o-mini. Replace API key with n8n credential. Temperature 0.7 for warm, natural tone.",
+            "onError": "continueErrorOutput"
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": true,
+                        "leftValue": "",
+                        "typeValidation": "strict"
+                    },
+                    "conditions": [
+                        {
+                            "id": "cond-ai-success",
+                            "leftValue": "={{ $json.choices && $json.choices[0] ? 'ok' : 'fail' }}",
+                            "rightValue": "ok",
+                            "operator": {
+                                "type": "string",
+                                "operation": "equals"
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                },
+                "options": {}
+            },
+            "id": "node-check-ai",
+            "name": "Check AI Response",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [
+                1780,
+                300
+            ],
+            "notes": "Validates AI returned a valid response. Routes to error handler if AI call failed."
+        },
+        {
+            "parameters": {
+                "jsCode": "// ─── EXTRACT & FORMAT AI OUTPUT ──────────────────────────────────\nconst aiResponse = $json;\nconst rawContent = aiResponse.choices?.[0]?.message?.content || '';\n\n// Extract subject line and body\nconst lines = rawContent.split('\\n');\nlet subject = 'Your BookLeaf Royalty Summary';\nlet body = rawContent;\n\nif (lines[0].startsWith('Subject:')) {\n  subject = lines[0].replace('Subject:', '').trim();\n  body = lines.slice(2).join('\\n').trim(); // skip subject + blank line\n}\n\n// Pass along the preceding node data\nconst prevData = $('Build AI Prompt').item.json;\n\nreturn [{\n  json: {\n    author_id: prevData.author.id,\n    author_name: prevData.author.name,\n    author_email: prevData.author.email,\n    email_subject: subject,\n    email_body: body,\n    log_id: prevData.log_id,\n    bubble_base_url: prevData.bubble_base_url,\n    bubble_api_key: prevData.bubble_api_key,\n    tokens_used: aiResponse.usage?.total_tokens || 0,\n    generated_at: new Date().toISOString()\n  }\n}];"
+            },
+            "id": "node-extract-output",
+            "name": "Extract AI Email Content",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                2000,
+                300
+            ],
+            "notes": "Parses the raw AI output to extract Subject and Body separately. Preserves all upstream context for the callback."
+        },
+        {
+            "parameters": {
+                "url": "={{ $json.bubble_base_url }}/notification_log/{{ $json.log_id }}",
+                "method": "PATCH",
+                "authentication": "genericCredentialType",
+                "genericAuthType": "httpHeaderAuth",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Authorization",
+                            "value": "=Bearer {{ $json.bubble_api_key }}"
+                        },
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "specifyBody": "json",
+                "jsonBody": "={\n  \"status\": \"Success\",\n  \"email_subject\": {{ JSON.stringify($json.email_subject) }},\n  \"email_body\": {{ JSON.stringify($json.email_body) }},\n  \"completed_at\": {{ JSON.stringify($json.generated_at) }},\n  \"tokens_used\": {{ $json.tokens_used }}\n}",
+                "options": {
+                    "timeout": 10000
+                }
+            },
+            "id": "node-update-log-success",
+            "name": "Update Notification Log (Success)",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                2220,
+                180
+            ],
+            "notes": "PATCHes the Bubble NotificationLog record with Success status, email content, timestamp, and token usage.",
+            "onError": "continueErrorOutput"
+        },
+        {
+            "parameters": {
+                "respondWith": "json",
+                "responseBody": "={\n  \"success\": true,\n  \"message\": \"Royalty summary generated and logged successfully\",\n  \"author_id\": \"{{ $('Extract AI Email Content').item.json.author_id }}\",\n  \"author_name\": \"{{ $('Extract AI Email Content').item.json.author_name }}\",\n  \"log_id\": \"{{ $('Extract AI Email Content').item.json.log_id }}\",\n  \"email_subject\": {{ JSON.stringify($('Extract AI Email Content').item.json.email_subject) }}\n}",
+                "options": {
+                    "responseCode": 200
+                }
+            },
+            "id": "node-respond-success",
+            "name": "Respond 200 OK",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [
+                2440,
+                180
+            ],
+            "notes": "Returns success response to Bubble. Bubble uses this to confirm the workflow completed."
+        },
+        {
+            "parameters": {
+                "jsCode": "// ─── ERROR AGGREGATOR ────────────────────────────────────────────\n// Determine which node failed and build structured error payload\nconst stage = $json.error ? $json.error.node || 'Unknown' : 'Unknown';\nconst message = $json.error?.message || $json.message || 'An unexpected error occurred';\n\nconst prevData = $('Validate & Extract Input').item.json || {};\n\nreturn [{\n  json: {\n    author_id: prevData.author_id || 'unknown',\n    log_id: prevData.log_id || null,\n    bubble_base_url: prevData.bubble_base_url || '',\n    bubble_api_key: prevData.bubble_api_key || '',\n    error_stage: stage,\n    error_message: message,\n    failed_at: new Date().toISOString()\n  }\n}];"
+            },
+            "id": "node-error-handler",
+            "name": "Error Handler",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                2000,
+                480
+            ],
+            "notes": "Catches errors from any node via error output connections. Formats structured error payload for logging."
+        },
+        {
+            "parameters": {
+                "url": "={{ $json.bubble_base_url }}/notification_log/{{ $json.log_id }}",
+                "method": "PATCH",
+                "authentication": "genericCredentialType",
+                "genericAuthType": "httpHeaderAuth",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Authorization",
+                            "value": "=Bearer {{ $json.bubble_api_key }}"
+                        },
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "specifyBody": "json",
+                "jsonBody": "={\n  \"status\": \"Failed\",\n  \"error_message\": {{ JSON.stringify($json.error_message) }},\n  \"error_stage\": {{ JSON.stringify($json.error_stage) }},\n  \"completed_at\": {{ JSON.stringify($json.failed_at) }}\n}",
+                "options": {
+                    "timeout": 10000
+                }
+            },
+            "id": "node-update-log-failed",
+            "name": "Update Notification Log (Failed)",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                2220,
+                480
+            ],
+            "notes": "PATCHes the Bubble NotificationLog with Failed status so the admin can see what went wrong."
+        },
+        {
+            "parameters": {
+                "respondWith": "json",
+                "responseBody": "={\n  \"success\": false,\n  \"message\": \"Workflow failed — notification log updated with error details\",\n  \"error_stage\": \"{{ $('Error Handler').item.json.error_stage }}\",\n  \"error_message\": {{ JSON.stringify($('Error Handler').item.json.error_message) }}\n}",
+                "options": {
+                    "responseCode": 500
+                }
+            },
+            "id": "node-respond-error",
+            "name": "Respond 500 Error",
+            "type": "n8n-nodes-base.respondToWebhook",
+            "typeVersion": 1,
+            "position": [
+                2440,
+                480
+            ],
+            "notes": "Returns 500 to Bubble with error details. Bubble UI displays this to admin instead of an infinite spinner."
+        }
+    ],
+    "connections": {
+        "Webhook Trigger": {
+            "main": [
+                [
+                    {
+                        "node": "Validate & Extract Input",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Validate & Extract Input": {
+            "main": [
+                [
+                    {
+                        "node": "Fetch Author Data from Bubble",
+                        "type": "main",
+                        "index": 0
+                    },
+                    {
+                        "node": "Fetch Author's Books from Bubble",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ],
+            "error": [
+                [
+                    {
+                        "node": "Error Handler",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Fetch Author Data from Bubble": {
+            "main": [
+                [
+                    {
+                        "node": "Check Fetch Success",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ],
+            "error": [
+                [
+                    {
+                        "node": "Error Handler",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Fetch Author's Books from Bubble": {
+            "main": [
+                [
+                    {
+                        "node": "Check Fetch Success",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ],
+            "error": [
+                [
+                    {
+                        "node": "Error Handler",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Check Fetch Success": {
+            "main": [
+                [
+                    {
+                        "node": "Aggregate Author & Book Data",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "Error Handler",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Aggregate Author & Book Data": {
+            "main": [
+                [
+                    {
+                        "node": "Build AI Prompt",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Build AI Prompt": {
+            "main": [
+                [
+                    {
+                        "node": "Call OpenAI API",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Call OpenAI API": {
+            "main": [
+                [
+                    {
+                        "node": "Check AI Response",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ],
+            "error": [
+                [
+                    {
+                        "node": "Error Handler",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Check AI Response": {
+            "main": [
+                [
+                    {
+                        "node": "Extract AI Email Content",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "Error Handler",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Extract AI Email Content": {
+            "main": [
+                [
+                    {
+                        "node": "Update Notification Log (Success)",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Update Notification Log (Success)": {
+            "main": [
+                [
+                    {
+                        "node": "Respond 200 OK",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ],
+            "error": [
+                [
+                    {
+                        "node": "Error Handler",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Error Handler": {
+            "main": [
+                [
+                    {
+                        "node": "Update Notification Log (Failed)",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Update Notification Log (Failed)": {
+            "main": [
+                [
+                    {
+                        "node": "Respond 500 Error",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        }
+    },
+    "active": true,
+    "settings": {
+        "executionOrder": "v1",
+        "saveManualExecutions": true,
+        "callerPolicy": "workflowsFromSameOwner",
+        "errorWorkflow": ""
+    },
+    "staticData": null,
+    "tags": [
+        "bookleaf",
+        "royalty",
+        "automation",
+        "openai"
+    ],
+    "pinData": {},
+    "versionId": "bookleaf-v1.0.0",
+    "meta": {
+        "instanceId": "bookleaf-n8n-instance",
+        "templateCredsSetupCompleted": false
+    }
+}

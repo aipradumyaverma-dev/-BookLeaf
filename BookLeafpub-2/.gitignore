@@ -1,0 +1,14 @@
+# BookLeafpub-2 — No build artifacts or secrets to ignore
+# This folder contains documentation-only deliverables
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor directories
+.vscode/
+.idea/
+
+# Environment files (add these if you add any config)
+.env
+*.env.local
